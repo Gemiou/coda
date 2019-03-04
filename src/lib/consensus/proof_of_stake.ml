@@ -117,7 +117,7 @@ module Epoch = struct
     if Time.(t < Constants.genesis_state_timestamp) then
       raise
         (Invalid_argument
-           "Epoch.of_time: time is less than genesis block timestamp") ;
+           "Epoch.of_time: time is earlier than genesis block timestamp") ;
     let time_since_genesis = Time.diff t Constants.genesis_state_timestamp in
     uint32_of_int64
       Int64.Infix.(
@@ -194,9 +194,9 @@ module Epoch = struct
   let slot_end_time (epoch : t) (slot : Slot.t) =
     Time.add (slot_start_time epoch slot) Constants.Slot.duration
 
-  let epoch_and_slot_of_time_exn t : t * Slot.t =
-    let epoch = of_time_exn t in
-    let time_since_epoch = Time.diff t (start_time epoch) in
+  let epoch_and_slot_of_time_exn tm : t * Slot.t =
+    let epoch = of_time_exn tm in
+    let time_since_epoch = Time.diff tm (start_time epoch) in
     let slot =
       uint32_of_int64
       @@ Int64.Infix.(
@@ -276,6 +276,12 @@ module Epoch_ledger = struct
   [@@deriving sexp, bin_io, eq, compare, hash]
 
   type var = (Coda_base.Frozen_ledger_hash.var, Amount.var) t
+
+  let var_of_value ({hash; total_currency} : value) : var =
+    (* reuse variable names; unusual case where fields are the same *)
+    let hash = Coda_base.Frozen_ledger_hash.var_of_t hash in
+    let total_currency = Amount.var_of_t total_currency in
+    {hash; total_currency}
 
   let to_hlist {hash; total_currency} = Coda_base.H_list.[hash; total_currency]
 
@@ -661,6 +667,17 @@ module Epoch_data = struct
     , Length.Unpacked.var )
     t
 
+  let var_of_value
+      ({ledger; seed; start_checkpoint; lock_checkpoint; length} : value) : var
+      =
+    (* reusing variable names; unusual case where field names are the same *)
+    let ledger = Epoch_ledger.var_of_value ledger in
+    let seed = Epoch_seed.var_of_t seed in
+    let start_checkpoint = Coda_base.State_hash.var_of_t start_checkpoint in
+    let lock_checkpoint = Coda_base.State_hash.var_of_t lock_checkpoint in
+    let length = Length.(unpack_value length |> Unpacked.var_of_value) in
+    {ledger; seed; start_checkpoint; lock_checkpoint; length}
+
   let to_hlist {ledger; seed; start_checkpoint; lock_checkpoint; length} =
     Coda_base.H_list.[ledger; seed; start_checkpoint; lock_checkpoint; length]
 
@@ -828,6 +845,40 @@ module Consensus_state = struct
     , Epoch.Slot.Unpacked.var
     , Epoch_data.var )
     t
+
+  let var_of_value
+      ({ length
+       ; epoch_length
+       ; last_vrf_output
+       ; total_currency
+       ; curr_epoch
+       ; curr_slot
+       ; last_epoch_data
+       ; curr_epoch_data } :
+        value) : var =
+    (* reusing variable names; unusual case where field names are the same *)
+    let length = Length.(unpack_value length |> Unpacked.var_of_value) in
+    let epoch_length =
+      Length.(unpack_value epoch_length |> Unpacked.var_of_value)
+    in
+    let last_vrf_output = Vrf.Output.Checked.constant last_vrf_output in
+    let total_currency = Amount.var_of_t total_currency in
+    let curr_epoch =
+      Epoch.(unpack_value curr_epoch |> Unpacked.var_of_value)
+    in
+    let curr_slot =
+      Epoch.Slot.(unpack_value curr_slot |> Unpacked.var_of_value)
+    in
+    let last_epoch_data = Epoch_data.var_of_value last_epoch_data in
+    let curr_epoch_data = Epoch_data.var_of_value curr_epoch_data in
+    { length
+    ; epoch_length
+    ; last_vrf_output
+    ; total_currency
+    ; curr_epoch
+    ; curr_slot
+    ; last_epoch_data
+    ; curr_epoch_data }
 
   let to_hlist
       { length
@@ -1556,5 +1607,70 @@ let%test "Receive an invalid consensus_state" =
       not
         (received_at_valid_time consensus_state
            ~time_received:(to_unix_timestamp time)) )
+
+let%test_module "Proof of stake tests" =
+  ( module struct
+    open Consensus_state
+
+    let%test "update, update_var agree starting from same consensus state" =
+      let open Quickcheck.Let_syntax in
+      (*      let module Stubs =
+        Coda_base.External_transition.Make
+          (Staged_ledger_diff)
+          (Protocol_state)
+      in *)
+      Quickcheck.random_value
+        ((* build pieces needed to apply "update" *)
+         let gen_slot_advancement = Core.Int.gen_incl 1 10 in
+         let%bind make_consensus_state =
+           For_tests.gen_consensus_state ~gen_slot_advancement
+         in
+         let previous_protocol_state = genesis_protocol_state in
+         let snarked_ledger_hash =
+           previous_protocol_state |> With_hash.data
+           |> Protocol_state.blockchain_state
+           |> Protocol_state.Blockchain_state.snarked_ledger_hash
+         in
+         let previous_consensus_state =
+           make_consensus_state ~snarked_ledger_hash ~previous_protocol_state
+         in
+         let epoch, slot =
+           Epoch.epoch_and_slot_of_time_exn
+             (Time.of_time (Core_kernel.Time.now ()))
+         in
+         let consensus_transition_data : Consensus_transition_data.value =
+           {epoch; slot}
+         in
+         let previous_protocol_state_hash =
+           With_hash.hash previous_protocol_state
+         in
+         let supply_increase = Currency.Amount.of_int 42 in
+         let proposer_vrf_result =
+           Random_oracle.Digest.of_string "proposer VRF result"
+         in
+         let new_consensus_state =
+           update ~previous_consensus_state ~consensus_transition_data
+             ~previous_protocol_state_hash ~supply_increase
+             ~snarked_ledger_hash ~proposer_vrf_result
+           |> Or_error.ok_exn
+         in
+         let previous_state = Consensus_state.var_of_value in
+         (*              ; epoch_length
+              ; last_vrf_output
+              ; total_currency
+              ; curr_epoch
+              ; curr_slot
+              ; last_epoch_data
+              ; curr_epoch_data }
+                = previous_protocol_state in *)
+         (*   let%snarkydef update_var (previous_state : var)
+      (transition_data : Consensus_transition_data.var)
+      (previous_protocol_state_hash : Coda_base.State_hash.var)
+      ~(supply_increase : Currency.Amount.var)
+      ~(previous_blockchain_state_ledger_hash :
+         Coda_base.Frozen_ledger_hash.var) =
+           *)
+         return true)
+  end )
 
 [%%endif]
